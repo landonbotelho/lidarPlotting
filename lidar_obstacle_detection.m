@@ -63,7 +63,7 @@ view(3);
 
 %% Step 3: Filter points outside our detection area
 
-% Define the region we want to examine
+% Define the region to examine
 minX = 0;
 maxX = 50;
 
@@ -74,10 +74,7 @@ minZ = -3;
 maxZ = 2;
 
 % Keep points inside the region
-validPoints = ...
-    x >= minX & x <= maxX & ...
-    y >= minY & y <= maxY & ...
-    z >= minZ & z <= maxZ;
+validPoints = x >= minX & x <= maxX & y >= minY & y <= maxY & z >= minZ & z <= maxZ;
 
 filteredPoints = points(validPoints, :);
 
