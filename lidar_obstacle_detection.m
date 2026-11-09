@@ -1,265 +1,272 @@
-%% MATLAB LiDAR Obstacle Detection and Mapping
-% Self-contained demonstration using simulated 2D LiDAR measurements.
-% Requires base MATLAB only (no additional toolboxes).
-%
-% Run this script in MATLAB. Local functions are defined at the end.
-% Tested design target: MATLAB R2016b or newer (scripts with local functions).
+% KITTI LiDAR Obstacle Detection
+% Reads real Velodyne LiDAR data from the KITTI dataset.
+% Filters the point cloud, removes approximate ground points,
+% detects potential obstacles, and displays the results.
 
 clear;
 clc;
 close all;
 
-rng(7); % Make the simulated scan repeatable.
+%% Step 1: Load a KITTI LiDAR scan
 
-%% 1. Define the environment
-% The LiDAR is located at the origin (0,0), facing the positive X direction.
-room = [-6, 6, -5, 5]; % [xmin, xmax, ymin, ymax]
+% Ask the user to select a KITTI .bin file
+% Name of our uploaded KITTI LiDAR file
+fileName = '0000000000.bin';
 
-% Each obstacle is a circle: [centerX, centerY, radius].
-obstacles = [
-    -2.0,  1.4, 0.75;
-     1.8,  2.0, 0.90;
-     2.6, -1.8, 0.65;
-    -2.8, -2.0, 0.85
-];
+% Location of the file
+folderPath = pwd;
 
-sensorPosition = [0, 0];
-maxRange = 10.0;
+% Open the selected file
+filePath = fullfile(folderPath, fileName);
+fileID = fopen(filePath, 'rb');
 
-%% 2. Simulate LiDAR measurements
-% A 0.5-degree angular resolution creates 720 measurements per scan.
-anglesDeg = 0:0.5:359.5;
-anglesRad = deg2rad(anglesDeg);
-measuredRanges = zeros(size(anglesRad));
-
-for i = 1:length(anglesRad)
-    direction = [cos(anglesRad(i)), sin(anglesRad(i))];
-
-    % Find the closest intersection with a room wall or circular obstacle.
-    measuredRanges(i) = simulateRay( ...
-        sensorPosition, direction, room, obstacles, maxRange);
+if fileID == -1
+    error('Could not open the selected file.');
 end
 
-% Add realistic measurement noise.
-noiseStdDev = 0.025; % Standard deviation in meters.
-noisyRanges = measuredRanges + noiseStdDev .* randn(size(measuredRanges));
+% KITTI stores each point as four 32-bit floating-point values:
+% x, y, z, and reflectance
+rawData = fread(fileID, 'single=>single');
+fclose(fileID);
 
-% Simulate occasional invalid readings.
-invalidIndices = rand(size(noisyRanges)) < 0.025;
-noisyRanges(invalidIndices) = NaN;
-
-% Values outside the sensor's usable range are also invalid.
-noisyRanges(noisyRanges <= 0 | noisyRanges > maxRange) = NaN;
-
-%% 3. Filter the measurements
-% Keep only finite, positive measurements within the sensor range.
-validMask = isfinite(noisyRanges) & ...
-            noisyRanges > 0 & noisyRanges <= maxRange;
-
-filteredRanges = noisyRanges;
-filteredRanges(~validMask) = NaN;
-
-%% 4. Convert polar measurements into Cartesian coordinates
-% x = range * cos(angle)
-% y = range * sin(angle)
-xPoints = filteredRanges .* cos(anglesRad);
-yPoints = filteredRanges .* sin(anglesRad);
-
-validPoints = [xPoints(validMask)', yPoints(validMask)'];
-
-%% 5. Group nearby scan points into obstacle clusters
-% The room boundary is farther away than the simulated obstacles.
-% Excluding long-range returns prevents the room walls from being labeled
-% as obstacles in this simple demonstration.
-obstacleMaxRange = 4.8;
-obstacleMask = validMask & filteredRanges < obstacleMaxRange;
-
-% This simple distance-based method avoids requiring a clustering toolbox.
-% A new cluster starts when:
-%   - a measurement is invalid or beyond obstacleMaxRange, or
-%   - two consecutive points are farther apart than clusterGap.
-
-clusterGap = 0.35;       % Maximum point-to-point gap, in meters.
-minimumClusterSize = 4;  % Ignore clusters with fewer points than this.
-
-clusters = {};
-currentCluster = [];
-
-for i = 1:length(anglesRad)
-    if ~obstacleMask(i)
-        % Invalid or long-range reading: finish the current cluster, if one exists.
-        if size(currentCluster, 1) >= minimumClusterSize
-            clusters{end + 1} = currentCluster; %#ok<SAGROW>
-        end
-        currentCluster = [];
-        continue;
-    end
-
-    point = [xPoints(i), yPoints(i)];
-
-    if isempty(currentCluster)
-        currentCluster = point;
-    else
-        previousPoint = currentCluster(end, :);
-        pointGap = norm(point - previousPoint);
-
-        if pointGap <= clusterGap
-            currentCluster = [currentCluster; point]; %#ok<AGROW>
-        else
-            if size(currentCluster, 1) >= minimumClusterSize
-                clusters{end + 1} = currentCluster; %#ok<SAGROW>
-            end
-            currentCluster = point;
-        end
-    end
+% Check that the file contains complete LiDAR points
+if mod(numel(rawData), 4) ~= 0
+    error('Invalid KITTI LiDAR file.');
 end
 
-% Save the final cluster after the loop.
-if size(currentCluster, 1) >= minimumClusterSize
-    clusters{end + 1} = currentCluster;
-end
+% Convert the data into rows of [x, y, z, reflectance]
+points = reshape(rawData, 4, [])';
 
-%% 6. Calculate a center and size estimate for each detected cluster
-clusterCenters = zeros(length(clusters), 2);
-clusterSizes = zeros(length(clusters), 1);
+x = points(:, 1);
+y = points(:, 2);
+z = points(:, 3);
+reflectance = points(:, 4);
 
-for i = 1:length(clusters)
-    points = clusters{i};
+fprintf('Loaded %d LiDAR points.\n', size(points, 1));
 
-    % The mean position is a simple estimate of the cluster center.
-    clusterCenters(i, :) = mean(points, 1);
+%% Step 2: Display the original 3D point cloud
 
-    % Estimate cluster size using the maximum distance from its center.
-    distancesFromCenter = sqrt(sum( ...
-        (points - clusterCenters(i, :)).^2, 2));
-    clusterSizes(i) = 2 * max(distancesFromCenter);
-end
+figure;
 
-%% 7. Display results
-fprintf('MATLAB LiDAR Obstacle Detection Results\n');
-fprintf('---------------------------------------\n');
-fprintf('Total LiDAR measurements: %d\n', length(anglesRad));
-fprintf('Valid measurements: %d\n', sum(validMask));
-fprintf('Invalid measurements: %d\n', sum(~validMask));
-fprintf('Detected point clusters: %d\n\n', length(clusters));
+scatter3(x, y, z, 2, reflectance, 'filled');
 
-for i = 1:length(clusters)
-    fprintf('Cluster %d: center = (%.2f, %.2f) m, approximate width = %.2f m\n', ...
-        i, clusterCenters(i, 1), clusterCenters(i, 2), clusterSizes(i));
-end
+xlabel('X (meters)');
+ylabel('Y (meters)');
+zlabel('Z (meters)');
 
-%% 8. Plot the LiDAR scan and detected clusters
-figure('Name', 'LiDAR Obstacle Detection', 'Color', 'w');
+title('Original KITTI LiDAR Point Cloud');
 
-hold on;
 axis equal;
 grid on;
+colorbar;
+view(3);
 
-% Draw room boundaries.
-plot([room(1), room(2), room(2), room(1), room(1)], ...
-     [room(3), room(3), room(4), room(4), room(3)], ...
-     'k-', 'LineWidth', 1.5);
+%% Step 3: Filter points outside our detection area
 
-% Draw all valid LiDAR points.
-scatter(xPoints(validMask), yPoints(validMask), ...
-    8, [0.35, 0.55, 0.85], 'filled');
+% Define the region we want to examine
+minX = 0;
+maxX = 50;
 
-% Draw each detected cluster and its estimated center.
-for i = 1:length(clusters)
-    points = clusters{i};
+minY = -25;
+maxY = 25;
 
-    scatter(points(:, 1), points(:, 2), 18, 'g', 'filled');
+minZ = -3;
+maxZ = 2;
 
-    plot(clusterCenters(i, 1), clusterCenters(i, 2), ...
-        'rx', 'MarkerSize', 12, 'LineWidth', 2);
+% Keep points inside the region
+validPoints = ...
+    x >= minX & x <= maxX & ...
+    y >= minY & y <= maxY & ...
+    z >= minZ & z <= maxZ;
 
-    text(clusterCenters(i, 1) + 0.12, ...
-         clusterCenters(i, 2) + 0.12, ...
-         sprintf('Obstacle %d', i), 'Color', 'r', 'FontWeight', 'bold');
+filteredPoints = points(validPoints, :);
+
+fprintf('Points after filtering: %d\n', ...
+    size(filteredPoints, 1));
+
+%% Step 4: Remove approximate ground points
+
+% Simple height threshold for removing ground
+% This value may need adjustment for different KITTI scans
+groundThreshold = -1.5;
+
+% Keep points above the threshold
+obstaclePoints = filteredPoints( ...
+    filteredPoints(:, 3) > groundThreshold, :);
+
+fprintf('Points after ground removal: %d\n', ...
+    size(obstaclePoints, 1));
+
+%% Step 5: Create a 2D occupancy grid
+
+% Each grid cell represents 0.25 meters
+cellSize = 0.25;
+
+numRows = ceil((maxY - minY) / cellSize);
+numCols = ceil((maxX - minX) / cellSize);
+
+% Initialize grid with zeros
+occupancyGrid = zeros(numRows, numCols);
+
+% Convert LiDAR coordinates into grid coordinates
+for i = 1:size(obstaclePoints, 1)
+
+    pointX = obstaclePoints(i, 1);
+    pointY = obstaclePoints(i, 2);
+
+    col = floor((pointX - minX) / cellSize) + 1;
+    row = floor((pointY - minY) / cellSize) + 1;
+
+    % Check that the coordinates are valid
+    if row >= 1 && row <= numRows && ...
+       col >= 1 && col <= numCols
+
+        occupancyGrid(row, col) = 1;
+    end
 end
 
-% Mark the LiDAR sensor.
-plot(sensorPosition(1), sensorPosition(2), ...
-    'kp', 'MarkerSize', 13, 'MarkerFaceColor', 'y');
+%% Step 6: Find connected obstacle regions
 
-xlabel('X position (meters)');
-ylabel('Y position (meters)');
-title('2D LiDAR Scan with Detected Point Clusters');
-legend('Room boundary', 'Valid LiDAR points', ...
-       'Detected cluster points', 'Estimated obstacle center', ...
-       'LiDAR sensor', 'Location', 'bestoutside');
+% Track which cells have already been visited
+visited = false(numRows, numCols);
 
-xlim([room(1) - 0.5, room(2) + 0.5]);
-ylim([room(3) - 0.5, room(4) + 0.5]);
-hold off;
+% Store detected obstacle clusters
+clusters = {};
 
-%% 9. Plot measured range versus angle
-figure('Name', 'LiDAR Range Measurements', 'Color', 'w');
+% Eight possible neighboring directions
+directions = [
+    -1 -1;
+    -1  0;
+    -1  1;
+     0 -1;
+     0  1;
+     1 -1;
+     1  0;
+     1  1
+];
 
-plot(anglesDeg, noisyRanges, '.', 'Color', [0.7, 0.7, 0.7]);
-hold on;
-plot(anglesDeg, filteredRanges, 'b-', 'LineWidth', 1);
-grid on;
+% Minimum occupied cells required for a cluster
+minClusterSize = 3;
 
-xlabel('Scan angle (degrees)');
-ylabel('Measured distance (meters)');
-title('LiDAR Range Measurements Before and After Filtering');
-legend('Raw noisy measurements', 'Filtered measurements');
-xlim([0, 360]);
-hold off;
+for row = 1:numRows
+    for col = 1:numCols
 
-%% Local functions
-
-function range = simulateRay(origin, direction, room, obstacles, maxRange)
-    % Return the nearest positive ray intersection with the room or an
-    % obstacle. If no intersection is found, return maxRange.
-
-    range = maxRange;
-
-    % Intersections with the four room walls.
-    if direction(1) > 0
-        t = (room(2) - origin(1)) / direction(1);
-        if t > 0
-            range = min(range, t);
+        % Skip empty or previously visited cells
+        if occupancyGrid(row, col) == 0 || visited(row, col)
+            continue;
         end
-    elseif direction(1) < 0
-        t = (room(1) - origin(1)) / direction(1);
-        if t > 0
-            range = min(range, t);
-        end
-    end
 
-    if direction(2) > 0
-        t = (room(4) - origin(2)) / direction(2);
-        if t > 0
-            range = min(range, t);
-        end
-    elseif direction(2) < 0
-        t = (room(3) - origin(2)) / direction(2);
-        if t > 0
-            range = min(range, t);
-        end
-    end
+        % Start a new cluster using a queue
+        queue = [row, col];
+        visited(row, col) = true;
 
-    % Intersections with circular obstacles.
-    for j = 1:size(obstacles, 1)
-        center = obstacles(j, 1:2);
-        radius = obstacles(j, 3);
+        clusterCells = [];
 
-        offset = origin - center;
-        b = dot(direction, offset);
-        c = dot(offset, offset) - radius^2;
-        discriminant = b^2 - c;
+        % Breadth-first search
+        while ~isempty(queue)
 
-        if discriminant >= 0
-            tNear = -b - sqrt(discriminant);
-            tFar = -b + sqrt(discriminant);
+            current = queue(1, :);
+            queue(1, :) = [];
 
-            if tNear > 0
-                range = min(range, tNear);
-            elseif tFar > 0
-                range = min(range, tFar);
+            clusterCells(end + 1, :) = current;
+
+            % Examine all eight neighboring cells
+            for d = 1:size(directions, 1)
+
+                nextRow = current(1) + directions(d, 1);
+                nextCol = current(2) + directions(d, 2);
+
+                % Check grid boundaries
+                if nextRow < 1 || nextRow > numRows || ...
+                   nextCol < 1 || nextCol > numCols
+                    continue;
+                end
+
+                % Add occupied, unvisited neighbors
+                if occupancyGrid(nextRow, nextCol) == 1 && ...
+                   ~visited(nextRow, nextCol)
+
+                    visited(nextRow, nextCol) = true;
+
+                    queue(end + 1, :) = [nextRow, nextCol];
+                end
             end
         end
+
+        % Keep clusters containing enough cells
+        if size(clusterCells, 1) >= minClusterSize
+            clusters{end + 1} = clusterCells;
+        end
     end
 end
+
+fprintf('Detected %d potential obstacle clusters.\n', ...
+    length(clusters));
+
+%% Step 7: Display detected obstacles
+
+figure;
+hold on;
+
+% Display obstacle points in gray
+scatter(obstaclePoints(:, 1), obstaclePoints(:, 2), ...
+    3, [0.7 0.7 0.7], 'filled');
+
+% Display each cluster with a different color
+colors = lines(max(length(clusters), 1));
+
+for i = 1:length(clusters)
+
+    clusterCells = clusters{i};
+
+    % Convert grid coordinates back to meters
+    clusterX = minX + ...
+        (clusterCells(:, 2) - 0.5) * cellSize;
+
+    clusterY = minY + ...
+        (clusterCells(:, 1) - 0.5) * cellSize;
+
+    % Calculate approximate center
+    centerX = mean(clusterX);
+    centerY = mean(clusterY);
+
+    % Draw cluster cells
+    scatter(clusterX, clusterY, 15, ...
+        colors(i, :), 'filled');
+
+    % Mark the center
+    plot(centerX, centerY, 'kx', ...
+        'MarkerSize', 10, 'LineWidth', 2);
+
+    % Label the cluster
+    text(centerX, centerY, sprintf(' %d', i));
+end
+
+xlabel('X (meters)');
+ylabel('Y (meters)');
+
+title('KITTI LiDAR Potential Obstacle Detection');
+
+axis equal;
+xlim([minX maxX]);
+ylim([minY maxY]);
+
+grid on;
+hold off;
+
+%% Step 8: Display the occupancy grid
+
+figure;
+
+imagesc([minX maxX], [minY maxY], occupancyGrid);
+
+set(gca, 'YDir', 'normal');
+
+xlabel('X (meters)');
+ylabel('Y (meters)');
+
+title('LiDAR Occupancy Grid');
+
+colormap(gray);
+colorbar;
+axis equal tight;
